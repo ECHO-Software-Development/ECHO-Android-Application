@@ -2,4 +2,6 @@
 <resources>
 
     <style name="Theme.ECHO" parent="android:Theme.Material.Light.NoActionBar" />
+
+    <style name="Theme.ECHO.Ble" parent="Theme.AppCompat.Light.NoActionBar" />
 </resources>

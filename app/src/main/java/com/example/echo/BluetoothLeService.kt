@@ -248,6 +248,16 @@ class BluetoothLeService : Service() {
         }
     }
 
+    fun disconnect() {
+        val gatt = bluetoothGatt
+        if (gatt == null) {
+            connectionState = STATE_DISCONNECTED
+            connecting = false
+            return
+        }
+        gatt.disconnect()
+    }
+
     /**
      * Sends a UTF-8 text message to the retranslator via the RX (write) characteristic.
      */

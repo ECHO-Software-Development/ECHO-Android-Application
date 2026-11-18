@@ -15,6 +15,9 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.ServiceConnection
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -27,8 +30,10 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.annotation.RequiresPermission
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -41,6 +46,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
@@ -48,10 +54,13 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledIconButton
+import androidx.compose.material3.FilledTonalIconButton
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.IconButtonDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
@@ -65,18 +74,29 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import androidx.core.content.ContextCompat
 import com.example.echo.BluetoothLeService.LocalBinder
 import com.example.echo.ui.theme.ECHOTheme
+import java.io.ByteArrayOutputStream
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -105,6 +125,7 @@ class MainActivity : ComponentActivity() {
     private val scannedDevices = mutableStateListOf<BluetoothDevice>()
 
     private val scanPeriod = 10_000L
+    private var nextLocalMessageId = 1L
 
     private val serviceConnection: ServiceConnection = object : ServiceConnection {
         @RequiresPermission(Manifest.permission.BLUETOOTH_CONNECT)
@@ -149,7 +170,37 @@ class MainActivity : ComponentActivity() {
                         BluetoothLeService.EXTRA_TIMESTAMP,
                         System.currentTimeMillis()
                     )
-                    messages.add(MessengerMessage(sender, text, timestamp))
+                    messages.add(MessengerMessage(sender = sender, text = text, timestamp = timestamp))
+                }
+
+                BluetoothLeService.ACTION_IMAGE_AVAILABLE -> {
+                    val imageData = intent.getByteArrayExtra(BluetoothLeService.EXTRA_IMAGE_DATA) ?: return
+                    val mime = intent.getStringExtra(BluetoothLeService.EXTRA_IMAGE_MIME) ?: "image/jpeg"
+                    val sender = intent.getStringExtra(BluetoothLeService.EXTRA_SENDER)
+                        ?: deviceName
+                        ?: deviceAddress
+                        ?: getString(R.string.unknown_device)
+                    val timestamp = intent.getLongExtra(
+                        BluetoothLeService.EXTRA_TIMESTAMP,
+                        System.currentTimeMillis()
+                    )
+                    messages.add(
+                        MessengerMessage(
+                            sender = sender,
+                            timestamp = timestamp,
+                            imageData = imageData,
+                            imageMimeType = mime
+                        )
+                    )
+                }
+
+                BluetoothLeService.ACTION_MESSAGE_SENT -> {
+                    val messageId = intent.getLongExtra(BluetoothLeService.EXTRA_MESSAGE_ID, -1L)
+                    if (messageId <= 0L) return
+                    val index = messages.indexOfFirst { it.localId == messageId }
+                    if (index >= 0) {
+                        messages[index] = messages[index].copy(isPending = false)
+                    }
                 }
             }
         }
@@ -189,6 +240,13 @@ class MainActivity : ComponentActivity() {
             }
         }
 
+    private val pickImageLauncher =
+        registerForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
+            if (uri != null) {
+                sendImageFromUri(uri)
+            }
+        }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
@@ -207,6 +265,7 @@ class MainActivity : ComponentActivity() {
                     inputText = inputText,
                     onInputChange = { inputText = it },
                     onSend = { sendMessage() },
+                    onPickImage = { pickImageLauncher.launch("image/*") },
                     onScanClick = { onScanRequested() },
                     onDisconnectClick = { onDisconnectRequested() },
                     showScanDialog = showScanDialog,
@@ -357,6 +416,8 @@ class MainActivity : ComponentActivity() {
             addAction(BluetoothLeService.ACTION_GATT_DISCONNECTED)
             addAction(BluetoothLeService.ACTION_GATT_SERVICES_DISCOVERED)
             addAction(BluetoothLeService.ACTION_DATA_AVAILABLE)
+            addAction(BluetoothLeService.ACTION_IMAGE_AVAILABLE)
+            addAction(BluetoothLeService.ACTION_MESSAGE_SENT)
         }
     }
 
@@ -365,13 +426,78 @@ class MainActivity : ComponentActivity() {
         if (text.isEmpty()) return
 
         val service = bluetoothService
-        if (service == null || !connected || !service.sendMessage(text)) {
+        val localId = nextLocalMessageId++
+        if (service == null || !connected || !service.sendMessage(text, localId)) {
             Toast.makeText(this, R.string.send_failed, Toast.LENGTH_SHORT).show()
             return
         }
 
         inputText = ""
-        messages.add(MessengerMessage(getString(R.string.you), text))
+        messages.add(
+            MessengerMessage(
+                sender = getString(R.string.you),
+                text = text,
+                localId = localId,
+                isPending = true
+            )
+        )
+    }
+
+    private fun sendImageFromUri(uri: Uri) {
+        val service = bluetoothService
+        if (service == null || !connected) {
+            Toast.makeText(this, R.string.send_failed, Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        try {
+            val inputStream = contentResolver.openInputStream(uri) ?: run {
+                Toast.makeText(this, R.string.send_failed, Toast.LENGTH_SHORT).show()
+                return
+            }
+            val original = inputStream.use { BitmapFactory.decodeStream(it) }
+            if (original == null) {
+                Toast.makeText(this, R.string.send_failed, Toast.LENGTH_SHORT).show()
+                return
+            }
+
+            val scaled = scaleBitmapForTransfer(original)
+            val out = ByteArrayOutputStream()
+            scaled.compress(Bitmap.CompressFormat.JPEG, 70, out)
+            val imageBytes = out.toByteArray()
+            if (scaled !== original) scaled.recycle()
+            original.recycle()
+
+            val localId = nextLocalMessageId++
+            if (!service.sendImage(imageBytes, "image/jpeg", localId)) {
+                Toast.makeText(this, R.string.send_failed, Toast.LENGTH_SHORT).show()
+                return
+            }
+
+            messages.add(
+                MessengerMessage(
+                    sender = getString(R.string.you),
+                    imageData = imageBytes,
+                    imageMimeType = "image/jpeg",
+                    localId = localId,
+                    isPending = true
+                )
+            )
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to send image", e)
+            Toast.makeText(this, R.string.send_failed, Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun scaleBitmapForTransfer(bitmap: Bitmap, maxDim: Int = 512): Bitmap {
+        val w = bitmap.width
+        val h = bitmap.height
+        val maxSide = maxOf(w, h)
+        if (maxSide <= maxDim) return bitmap
+        val scale = maxDim.toFloat() / maxSide.toFloat()
+        val nw = (w * scale).toInt().coerceAtLeast(1)
+        val nh = (h * scale).toInt().coerceAtLeast(1)
+        return Bitmap.createScaledBitmap(bitmap, nw, nh, true)
     }
 }
 
@@ -386,6 +512,7 @@ fun MessengerScreen(
     inputText: String,
     onInputChange: (String) -> Unit,
     onSend: () -> Unit,
+    onPickImage: () -> Unit,
     onScanClick: () -> Unit,
     onDisconnectClick: () -> Unit,
     showScanDialog: Boolean,
@@ -396,6 +523,7 @@ fun MessengerScreen(
 ) {
     val listState = rememberLazyListState()
     val focusManager = LocalFocusManager.current
+    var previewMessage by remember { mutableStateOf<MessengerMessage?>(null) }
 
     LaunchedEffect(messages.size) {
         if (messages.isNotEmpty()) {
@@ -416,6 +544,15 @@ fun MessengerScreen(
             onDeviceSelected = onDeviceSelected,
             onDismiss = onDismissScan
         )
+    }
+
+    previewMessage?.let { message ->
+        if (message.isImage && message.imageData != null) {
+            ImagePreviewDialog(
+                message = message,
+                onDismiss = { previewMessage = null }
+            )
+        }
     }
 
     Scaffold(
@@ -468,6 +605,7 @@ fun MessengerScreen(
                     value = inputText,
                     onValueChange = onInputChange,
                     onSend = onSend,
+                    onPickImage = onPickImage,
                     enabled = true
                 )
             }
@@ -492,7 +630,11 @@ fun MessengerScreen(
             ) {
                 items(messages) { message ->
                     val isMine = message.sender == stringResource(R.string.you)
-                    MessageBubble(message = message, isMine = isMine)
+                    MessageBubble(
+                        message = message,
+                        isMine = isMine,
+                        onImageTap = { previewMessage = it }
+                    )
                 }
             }
         }
@@ -518,7 +660,11 @@ fun EmptyChatHint(modifier: Modifier = Modifier, connected: Boolean, hasDevice: 
 }
 
 @Composable
-fun MessageBubble(message: MessengerMessage, isMine: Boolean) {
+fun MessageBubble(
+    message: MessengerMessage,
+    isMine: Boolean,
+    onImageTap: (MessengerMessage) -> Unit
+) {
     val timeFormat = SimpleDateFormat("HH:mm", Locale.getDefault())
     val bubbleColor = if (isMine) {
         MaterialTheme.colorScheme.primaryContainer
@@ -547,7 +693,7 @@ fun MessageBubble(message: MessengerMessage, isMine: Boolean) {
             tonalElevation = 1.dp,
             modifier = Modifier.widthIn(max = 320.dp)
         ) {
-            Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
+            Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp)) {
                 if (!isMine) {
                     Text(
                         text = message.sender,
@@ -555,15 +701,41 @@ fun MessageBubble(message: MessengerMessage, isMine: Boolean) {
                         fontWeight = FontWeight.SemiBold,
                         color = MaterialTheme.colorScheme.primary
                     )
-                    Spacer(modifier = Modifier.height(2.dp))
+                    Spacer(modifier = Modifier.height(4.dp))
                 }
-                Text(
-                    text = message.text,
-                    style = MaterialTheme.typography.bodyLarge
-                )
+                if (message.isImage && message.imageData != null) {
+                    val bitmap = remember(message.imageData) {
+                        BitmapFactory.decodeByteArray(message.imageData, 0, message.imageData.size)
+                    }
+                    if (bitmap != null) {
+                        Image(
+                            bitmap = bitmap.asImageBitmap(),
+                            contentDescription = "Image",
+                            modifier = Modifier
+                                .widthIn(max = 260.dp)
+                                .height(180.dp)
+                                .clip(RoundedCornerShape(12.dp))
+                                .clickable { onImageTap(message) },
+                            contentScale = ContentScale.Crop
+                        )
+                    } else {
+                        Text(
+                            text = "Image",
+                            style = MaterialTheme.typography.bodyLarge
+                        )
+                    }
+                } else {
+                    Text(
+                        text = message.text,
+                        style = MaterialTheme.typography.bodyLarge
+                    )
+                }
                 Spacer(modifier = Modifier.height(4.dp))
                 Text(
-                    text = timeFormat.format(Date(message.timestamp)),
+                    text = buildString {
+                        append(timeFormat.format(Date(message.timestamp)))
+                        if (isMine && !message.isPending) append("  ✓")
+                    },
                     style = MaterialTheme.typography.labelSmall,
                     color = textColor.copy(alpha = 0.75f),
                     modifier = Modifier.align(Alignment.End)
@@ -578,6 +750,7 @@ fun MessageInputBar(
     value: String,
     onValueChange: (String) -> Unit,
     onSend: () -> Unit,
+    onPickImage: () -> Unit,
     enabled: Boolean
 ) {
     Surface(
@@ -589,9 +762,19 @@ fun MessageInputBar(
                 .fillMaxWidth()
                 .navigationBarsPadding()
                 .imePadding()
-                .padding(horizontal = 12.dp, vertical = 8.dp),
+                .padding(horizontal = 8.dp, vertical = 8.dp),
             verticalAlignment = Alignment.Bottom
         ) {
+            FilledTonalIconButton(
+                onClick = onPickImage,
+                enabled = enabled
+            ) {
+                Icon(
+                    painter = painterResource(R.drawable.ic_image),
+                    contentDescription = "Attach image"
+                )
+            }
+            Spacer(modifier = Modifier.width(6.dp))
             OutlinedTextField(
                 value = value,
                 onValueChange = onValueChange,
@@ -601,12 +784,88 @@ fun MessageInputBar(
                 shape = RoundedCornerShape(24.dp),
                 maxLines = 4
             )
-            Spacer(modifier = Modifier.width(8.dp))
+            Spacer(modifier = Modifier.width(6.dp))
             FilledIconButton(
                 onClick = onSend,
                 enabled = enabled && value.trim().isNotEmpty()
             ) {
-                Text("➤", style = MaterialTheme.typography.titleMedium)
+                Icon(
+                    painter = painterResource(R.drawable.ic_send),
+                    contentDescription = "Send"
+                )
+            }
+        }
+    }
+}
+
+@Composable
+fun ImagePreviewDialog(message: MessengerMessage, onDismiss: () -> Unit) {
+    val bitmap = remember(message.imageData) {
+        message.imageData?.let { BitmapFactory.decodeByteArray(it, 0, it.size) }
+    }
+    var scale by remember { mutableStateOf(1f) }
+    var offsetX by remember { mutableStateOf(0f) }
+    var offsetY by remember { mutableStateOf(0f) }
+
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false)
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(Color.Black)
+        ) {
+            if (bitmap != null) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .pointerInput(Unit) {
+                            detectTransformGestures { _, pan, zoom, _ ->
+                                val newScale = (scale * zoom).coerceIn(1f, 5f)
+                                if (newScale == 1f) {
+                                    offsetX = 0f
+                                    offsetY = 0f
+                                } else {
+                                    offsetX += pan.x
+                                    offsetY += pan.y
+                                }
+                                scale = newScale
+                            }
+                        },
+                    contentAlignment = Alignment.Center
+                ) {
+                    Image(
+                        bitmap = bitmap.asImageBitmap(),
+                        contentDescription = "Image preview",
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .graphicsLayer(
+                                scaleX = scale,
+                                scaleY = scale,
+                                translationX = offsetX,
+                                translationY = offsetY
+                            ),
+                        contentScale = ContentScale.Fit
+                    )
+                }
+            }
+
+            IconButton(
+                onClick = onDismiss,
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .statusBarsPadding()
+                    .padding(8.dp),
+                colors = IconButtonDefaults.iconButtonColors(
+                    containerColor = Color.Black.copy(alpha = 0.45f),
+                    contentColor = Color.White
+                )
+            ) {
+                Icon(
+                    painter = painterResource(R.drawable.ic_close),
+                    contentDescription = "Close preview"
+                )
             }
         }
     }

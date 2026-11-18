@@ -4,26 +4,46 @@ import org.json.JSONException
 import org.json.JSONObject
 
 /**
- * A single message received from (or sent to) the ESP32.
+ * A single chat message (text or image).
  */
 data class MessengerMessage(
     val sender: String,
-    val text: String,
-    val timestamp: Long = System.currentTimeMillis()
-)
+    val text: String = "",
+    val timestamp: Long = System.currentTimeMillis(),
+    val imageData: ByteArray? = null,
+    val imageMimeType: String? = null,
+    val localId: Long? = null,
+    val isPending: Boolean = false
+) {
+    val isImage: Boolean get() = imageData != null && imageData.isNotEmpty()
+
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (other !is MessengerMessage) return false
+        return sender == other.sender &&
+            text == other.text &&
+            timestamp == other.timestamp &&
+            imageMimeType == other.imageMimeType &&
+            localId == other.localId &&
+            isPending == other.isPending &&
+            ((imageData == null && other.imageData == null) ||
+                (imageData != null && other.imageData != null && imageData.contentEquals(other.imageData)))
+    }
+
+    override fun hashCode(): Int {
+        var result = sender.hashCode()
+        result = 31 * result + text.hashCode()
+        result = 31 * result + timestamp.hashCode()
+        result = 31 * result + (imageData?.contentHashCode() ?: 0)
+        result = 31 * result + (imageMimeType?.hashCode() ?: 0)
+        result = 31 * result + (localId?.hashCode() ?: 0)
+        result = 31 * result + isPending.hashCode()
+        return result
+    }
+}
 
 /**
- * Parses a BLE payload into a [MessengerMessage].
- *
- * Supported UTF-8 payloads:
- *  1. JSON:  {"from":"alice","text":"hello","timestamp":1699999999999}
- *     Field aliases: from/sender/user/nickname, text/message/msg/body.
- *  2. Pipe:  "alice|hello"
- *  3. Colon: "alice: hello"
- *  4. Plain: "hello"  -> sender falls back to the BLE device name/address.
- *
- * If the timestamp is missing it defaults to "now". Timestamps in seconds are
- * converted to milliseconds automatically.
+ * Parses a BLE text payload into a [MessengerMessage].
  */
 object MessengerMessageParser {
 
@@ -31,7 +51,7 @@ object MessengerMessageParser {
         val trimmed = raw.trim()
         parseJson(trimmed, fallbackSender)?.let { return it }
         parseDelimited(trimmed, fallbackSender)?.let { return it }
-        return MessengerMessage(fallbackSender, trimmed)
+        return MessengerMessage(sender = fallbackSender, text = trimmed)
     }
 
     private fun parseJson(raw: String, fallbackSender: String): MessengerMessage? {
@@ -56,8 +76,8 @@ object MessengerMessageParser {
                 else -> rawTimestamp
             }
 
-            MessengerMessage(sender, text, timestamp)
-        } catch (exception: JSONException) {
+            MessengerMessage(sender = sender, text = text, timestamp = timestamp)
+        } catch (_: JSONException) {
             null
         }
     }
@@ -75,10 +95,8 @@ object MessengerMessageParser {
         val text = raw.substring(index + 1).trim()
         if (sender.isEmpty() || text.isEmpty()) return null
 
-        // For "sender: text" avoid treating ordinary sentences like "note: buy milk"
-        // as a sender prefix. Pipe-delimited messages may contain spaces.
         if (separator == ':' && (sender.contains(' ') || sender.length > 32)) return null
 
-        return MessengerMessage(sender, text)
+        return MessengerMessage(sender = sender, text = text)
     }
 }

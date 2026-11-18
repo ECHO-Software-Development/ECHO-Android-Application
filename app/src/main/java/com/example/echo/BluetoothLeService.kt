@@ -30,7 +30,9 @@ import android.bluetooth.BluetoothProfile
 import android.content.Intent
 import android.os.Binder
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.util.Log
 import androidx.annotation.RequiresPermission
 import java.util.ArrayDeque
@@ -55,6 +57,29 @@ class BluetoothLeService : Service() {
     private val pendingDescriptorValues = mutableMapOf<BluetoothGattDescriptor, ByteArray>()
     private var writingDescriptor = false
 
+    private data class OutgoingWrite(
+        val payload: ByteArray,
+        val messageId: Long? = null,
+        val isLastForMessage: Boolean = false
+    )
+
+    private val characteristicWriteQueue = ArrayDeque<OutgoingWrite>()
+    private var writingCharacteristic = false
+    private var currentOutgoingWrite: OutgoingWrite? = null
+    private var negotiatedMtu = 23
+    private val handler = Handler(Looper.getMainLooper())
+
+    private data class IncomingImage(
+        val sender: String,
+        val msgId: Int,
+        val totalChunks: Int,
+        val mimeType: String,
+        val totalSize: Int,
+        val chunks: MutableMap<Int, ByteArray> = mutableMapOf()
+    )
+
+    private val incomingImages = mutableMapOf<Int, IncomingImage>()
+
     companion object {
         const val ACTION_GATT_CONNECTED =
             "com.example.bluetooth.le.ACTION_GATT_CONNECTED"
@@ -64,13 +89,25 @@ class BluetoothLeService : Service() {
             "com.example.bluetooth.le.ACTION_GATT_SERVICES_DISCOVERED"
         const val ACTION_DATA_AVAILABLE =
             "com.example.echo.ACTION_DATA_AVAILABLE"
+        const val ACTION_IMAGE_AVAILABLE =
+            "com.example.echo.ACTION_IMAGE_AVAILABLE"
+        const val ACTION_MESSAGE_SENT =
+            "com.example.echo.ACTION_MESSAGE_SENT"
 
         const val EXTRA_SENDER = "com.example.echo.EXTRA_SENDER"
         const val EXTRA_MESSAGE = "com.example.echo.EXTRA_MESSAGE"
         const val EXTRA_TIMESTAMP = "com.example.echo.EXTRA_TIMESTAMP"
         const val EXTRA_RAW_DATA = "com.example.echo.EXTRA_RAW_DATA"
+        const val EXTRA_IMAGE_DATA = "com.example.echo.EXTRA_IMAGE_DATA"
+        const val EXTRA_IMAGE_MIME = "com.example.echo.EXTRA_IMAGE_MIME"
+        const val EXTRA_MESSAGE_ID = "com.example.echo.EXTRA_MESSAGE_ID"
         const val EXTRA_CHARACTERISTIC_UUID =
             "com.example.echo.EXTRA_CHARACTERISTIC_UUID"
+
+        private val IMAGE_MAGIC = byteArrayOf(0xEC.toByte(), 0x01)
+        private const val PKT_IMAGE_START: Byte = 0x02
+        private const val PKT_IMAGE_CHUNK: Byte = 0x03
+        private const val PKT_IMAGE_END: Byte = 0x04
 
         /**
          * UUIDs for the ECHO retranslator (NimBLE, little-endian in firmware).
@@ -111,6 +148,11 @@ class BluetoothLeService : Service() {
                     descriptorWriteQueue.clear()
                     pendingDescriptorValues.clear()
                     writingDescriptor = false
+                    characteristicWriteQueue.clear()
+                    writingCharacteristic = false
+                    currentOutgoingWrite = null
+                    incomingImages.clear()
+                    handler.removeCallbacksAndMessages(null)
                     gatt?.close()
                     if (bluetoothGatt === gatt) {
                         bluetoothGatt = null
@@ -129,7 +171,10 @@ class BluetoothLeService : Service() {
         }
 
         override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
-            Log.d(TAG, "MTU changed to $mtu (status=$status)")
+            if (status == BluetoothGatt.GATT_SUCCESS) {
+                negotiatedMtu = mtu
+            }
+            Log.d(TAG, "MTU changed to $mtu (status=$status), using $negotiatedMtu")
             gatt.discoverServices()
         }
 
@@ -146,6 +191,22 @@ class BluetoothLeService : Service() {
             }
             writingDescriptor = false
             writeNextDescriptor()
+        }
+
+        override fun onCharacteristicWrite(
+            gatt: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic,
+            status: Int
+        ) {
+            val completed = currentOutgoingWrite
+            currentOutgoingWrite = null
+            writingCharacteristic = false
+            if (status != BluetoothGatt.GATT_SUCCESS) {
+                Log.w(TAG, "onCharacteristicWrite failed: $status")
+            } else if (completed != null && completed.isLastForMessage && completed.messageId != null) {
+                broadcastMessageSent(completed.messageId)
+            }
+            writeNextCharacteristic()
         }
 
         @Deprecated("Deprecated in Java")
@@ -261,11 +322,67 @@ class BluetoothLeService : Service() {
     /**
      * Sends a UTF-8 text message to the retranslator via the RX (write) characteristic.
      */
-    @Suppress("DEPRECATION")
-    fun sendMessage(text: String): Boolean {
+    fun sendMessage(text: String, messageId: Long = 0L): Boolean {
+        return enqueueRawWrite(text.toByteArray(Charsets.UTF_8), messageId)
+    }
+
+    /**
+     * Sends an image as chunked binary packets over BLE.
+     */
+    fun sendImage(data: ByteArray, mimeType: String = "image/jpeg", messageId: Long = 0L): Boolean {
+        if (data.isEmpty()) return false
         val gatt = bluetoothGatt ?: return false
-        val characteristic = findWritableCharacteristic(gatt) ?: return false
-        val payload = text.toByteArray(Charsets.UTF_8)
+        if (findWritableCharacteristic(gatt) == null) return false
+
+        val msgId = (System.currentTimeMillis() and 0xFFFF).toInt()
+        val mimeBytes = mimeType.toByteArray(Charsets.UTF_8).take(255).toByteArray()
+        val payloadCapacity = (negotiatedMtu - 3 - 10).coerceAtLeast(20) // header overhead for chunks
+        val totalChunks = ((data.size + payloadCapacity - 1) / payloadCapacity).coerceAtLeast(1)
+
+        val start = buildImageStartPacket(msgId, totalChunks, mimeBytes, data.size)
+        characteristicWriteQueue.addLast(OutgoingWrite(start, messageId, false))
+
+        var offset = 0
+        var chunkIndex = 0
+        while (offset < data.size) {
+            val end = minOf(offset + payloadCapacity, data.size)
+            val chunk = data.copyOfRange(offset, end)
+            characteristicWriteQueue.addLast(
+                OutgoingWrite(buildImageChunkPacket(msgId, chunkIndex, chunk), messageId, false)
+            )
+            offset = end
+            chunkIndex++
+        }
+        characteristicWriteQueue.addLast(
+            OutgoingWrite(buildImageEndPacket(msgId), messageId, messageId != 0L)
+        )
+
+        writeNextCharacteristic()
+        return true
+    }
+
+    private fun enqueueRawWrite(payload: ByteArray, messageId: Long = 0L): Boolean {
+        val gatt = bluetoothGatt ?: return false
+        if (findWritableCharacteristic(gatt) == null) return false
+        characteristicWriteQueue.addLast(
+            OutgoingWrite(payload, messageId, messageId != 0L)
+        )
+        writeNextCharacteristic()
+        return true
+    }
+
+    @Suppress("DEPRECATION")
+    private fun writeNextCharacteristic() {
+        if (writingCharacteristic) return
+        val gatt = bluetoothGatt ?: return
+        val characteristic = findWritableCharacteristic(gatt) ?: run {
+            characteristicWriteQueue.clear()
+            currentOutgoingWrite = null
+            return
+        }
+        val outgoing = characteristicWriteQueue.pollFirst() ?: return
+        currentOutgoingWrite = outgoing
+
         val writeType =
             if (characteristic.properties and BluetoothGattCharacteristic.PROPERTY_WRITE != 0) {
                 BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
@@ -273,13 +390,79 @@ class BluetoothLeService : Service() {
                 BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
             }
 
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            gatt.writeCharacteristic(characteristic, payload, writeType) == BluetoothGatt.GATT_SUCCESS
+        writingCharacteristic = true
+        val started = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            gatt.writeCharacteristic(characteristic, outgoing.payload, writeType) == BluetoothGatt.GATT_SUCCESS
         } else {
             characteristic.writeType = writeType
-            characteristic.value = payload
+            characteristic.value = outgoing.payload
             gatt.writeCharacteristic(characteristic)
         }
+
+        if (!started) {
+            Log.w(TAG, "Failed to start characteristic write")
+            writingCharacteristic = false
+            currentOutgoingWrite = null
+            characteristicWriteQueue.clear()
+        } else if (writeType == BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE) {
+            // Pace no-response writes to avoid overrunning the BLE stack.
+            val completed = outgoing
+            handler.postDelayed({
+                writingCharacteristic = false
+                currentOutgoingWrite = null
+                if (completed.isLastForMessage && completed.messageId != null && completed.messageId != 0L) {
+                    broadcastMessageSent(completed.messageId)
+                }
+                writeNextCharacteristic()
+            }, 30)
+        }
+    }
+
+    private fun broadcastMessageSent(messageId: Long) {
+        val intent = Intent(ACTION_MESSAGE_SENT).apply {
+            setPackage(packageName)
+            putExtra(EXTRA_MESSAGE_ID, messageId)
+        }
+        sendBroadcast(intent)
+    }
+
+    private fun buildImageStartPacket(
+        msgId: Int,
+        totalChunks: Int,
+        mimeBytes: ByteArray,
+        totalSize: Int
+    ): ByteArray {
+        val size = 2 + 1 + 2 + 2 + 1 + mimeBytes.size + 4
+        val buf = java.nio.ByteBuffer.allocate(size)
+        buf.put(IMAGE_MAGIC)
+        buf.put(PKT_IMAGE_START)
+        buf.putShort(msgId.toShort())
+        buf.putShort(totalChunks.toShort())
+        buf.put(mimeBytes.size.toByte())
+        buf.put(mimeBytes)
+        buf.putInt(totalSize)
+        return buf.array()
+    }
+
+    private fun buildImageChunkPacket(msgId: Int, chunkIndex: Int, data: ByteArray): ByteArray {
+        val size = 2 + 1 + 2 + 2 + 2 + data.size
+        val buf = java.nio.ByteBuffer.allocate(size)
+        buf.put(IMAGE_MAGIC)
+        buf.put(PKT_IMAGE_CHUNK)
+        buf.putShort(msgId.toShort())
+        buf.putShort(chunkIndex.toShort())
+        buf.putShort(data.size.toShort())
+        buf.put(data)
+        return buf.array()
+    }
+
+    private fun buildImageEndPacket(msgId: Int): ByteArray {
+        val size = 2 + 1 + 2
+        val buf = java.nio.ByteBuffer.allocate(size)
+        buf.put(IMAGE_MAGIC)
+        buf.put(PKT_IMAGE_END)
+        buf.putShort(msgId.toShort())
+        return buf.array()
     }
 
     private fun findWritableCharacteristic(gatt: BluetoothGatt): BluetoothGattCharacteristic? {
@@ -400,7 +583,84 @@ class BluetoothLeService : Service() {
         characteristic: BluetoothGattCharacteristic,
         value: ByteArray
     ) {
+        if (value.isEmpty()) return
+        if (isImagePacket(value)) {
+            handleImagePacket(value)
+            return
+        }
         broadcastUpdate(ACTION_DATA_AVAILABLE, characteristic, value)
+    }
+
+    private fun isImagePacket(value: ByteArray): Boolean {
+        return value.size >= 3 &&
+            value[0] == IMAGE_MAGIC[0] &&
+            value[1] == IMAGE_MAGIC[1] &&
+            (value[2] == PKT_IMAGE_START || value[2] == PKT_IMAGE_CHUNK || value[2] == PKT_IMAGE_END)
+    }
+
+    private fun handleImagePacket(value: ByteArray) {
+        try {
+            val buf = java.nio.ByteBuffer.wrap(value)
+            buf.get() // magic 0
+            buf.get() // magic 1
+            val type = buf.get()
+            val fallbackSender = bluetoothGatt?.device?.let { device ->
+                device.name ?: device.address
+            } ?: "ESP32"
+
+            when (type) {
+                PKT_IMAGE_START -> {
+                    val msgId = buf.short.toInt() and 0xFFFF
+                    val totalChunks = buf.short.toInt() and 0xFFFF
+                    val mimeLen = buf.get().toInt() and 0xFF
+                    val mimeBytes = ByteArray(mimeLen)
+                    buf.get(mimeBytes)
+                    val totalSize = buf.int
+                    val mime = mimeBytes.toString(Charsets.UTF_8)
+                    incomingImages[msgId] = IncomingImage(
+                        sender = fallbackSender,
+                        msgId = msgId,
+                        totalChunks = totalChunks,
+                        mimeType = mime.ifBlank { "image/jpeg" },
+                        totalSize = totalSize
+                    )
+                }
+
+                PKT_IMAGE_CHUNK -> {
+                    val msgId = buf.short.toInt() and 0xFFFF
+                    val chunkIndex = buf.short.toInt() and 0xFFFF
+                    val len = buf.short.toInt() and 0xFFFF
+                    val data = ByteArray(len)
+                    buf.get(data)
+                    incomingImages[msgId]?.chunks?.put(chunkIndex, data)
+                }
+
+                PKT_IMAGE_END -> {
+                    val msgId = buf.short.toInt() and 0xFFFF
+                    val incoming = incomingImages.remove(msgId) ?: return
+                    val output = java.io.ByteArrayOutputStream()
+                    for (i in 0 until incoming.totalChunks) {
+                        val chunk = incoming.chunks[i] ?: return
+                        output.write(chunk)
+                    }
+                    val imageBytes = output.toByteArray()
+                    broadcastImage(incoming.sender, imageBytes, incoming.mimeType)
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to parse image packet", e)
+        }
+    }
+
+    private fun broadcastImage(sender: String, imageData: ByteArray, mimeType: String) {
+        val intent = Intent(ACTION_IMAGE_AVAILABLE).apply {
+            setPackage(packageName)
+            putExtra(EXTRA_SENDER, sender)
+            putExtra(EXTRA_IMAGE_DATA, imageData)
+            putExtra(EXTRA_IMAGE_MIME, mimeType)
+            putExtra(EXTRA_TIMESTAMP, System.currentTimeMillis())
+        }
+        sendBroadcast(intent)
     }
 
     // [START android_bluetooth_broadcast]
@@ -411,13 +671,7 @@ class BluetoothLeService : Service() {
     // [END android_bluetooth_broadcast]
 
     /**
-     * Converts an incoming BLE payload into a messenger event.
-     *
-     * Supported UTF-8 payloads:
-     *  - JSON:  {"from":"alice","text":"hello","timestamp":1699999999999}
-     *  - Text:  "alice|hello"
-     *  - Text:  "alice: hello"
-     *  - Plain: "hello" (sender falls back to the BLE device name/address)
+     * Converts an incoming BLE text payload into a messenger event.
      */
     private fun broadcastUpdate(
         action: String,
@@ -456,6 +710,11 @@ class BluetoothLeService : Service() {
         descriptorWriteQueue.clear()
         pendingDescriptorValues.clear()
         writingDescriptor = false
+        characteristicWriteQueue.clear()
+        writingCharacteristic = false
+        currentOutgoingWrite = null
+        incomingImages.clear()
+        handler.removeCallbacksAndMessages(null)
         bluetoothGatt?.close()
         bluetoothGatt = null
     }

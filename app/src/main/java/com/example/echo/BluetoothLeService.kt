@@ -29,6 +29,7 @@ import android.bluetooth.BluetoothGattService
 import android.bluetooth.BluetoothProfile
 import android.content.Intent
 import android.os.Binder
+import android.os.Build
 import android.os.IBinder
 import android.util.Log
 import androidx.annotation.RequiresPermission
@@ -51,6 +52,7 @@ class BluetoothLeService : Service() {
     private var connecting = false
 
     private val descriptorWriteQueue = ArrayDeque<BluetoothGattDescriptor>()
+    private val pendingDescriptorValues = mutableMapOf<BluetoothGattDescriptor, ByteArray>()
     private var writingDescriptor = false
 
     companion object {
@@ -71,16 +73,17 @@ class BluetoothLeService : Service() {
             "com.example.echo.EXTRA_CHARACTERISTIC_UUID"
 
         /**
-         * Defaults match the Nordic UART Service (NUS), which is widely used by
-         * ESP32 BLE examples. Change these UUIDs if your firmware exposes a
-         * custom service/characteristic instead.
+         * UUIDs for the ECHO retranslator (NimBLE, little-endian in firmware).
+         *   service fea60001-0324-45f8-8acc-193637d7af72
+         *   RX char fea60002-0324-45f8-8acc-193637d7af72 (write)
+         *   TX char fea60003-0324-45f8-8acc-193637d7af72 (notify)
          */
         val MESSAGE_SERVICE_UUID: UUID =
-            UUID.fromString("6E400001-B5A3-F393-E0A9-E50E24DCCA9E")
+            UUID.fromString("fea60001-0324-45f8-8acc-193637d7af72")
         val MESSAGE_RX_CHARACTERISTIC_UUID: UUID =
-            UUID.fromString("6E400002-B5A3-F393-E0A9-E50E24DCCA9E")
+            UUID.fromString("fea60002-0324-45f8-8acc-193637d7af72")
         val MESSAGE_TX_CHARACTERISTIC_UUID: UUID =
-            UUID.fromString("6E400003-B5A3-F393-E0A9-E50E24DCCA9E")
+            UUID.fromString("fea60003-0324-45f8-8acc-193637d7af72")
 
         private val CLIENT_CHARACTERISTIC_CONFIG_UUID: UUID =
             UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
@@ -106,6 +109,7 @@ class BluetoothLeService : Service() {
                     connectionState = STATE_DISCONNECTED
                     broadcastUpdate(ACTION_GATT_DISCONNECTED)
                     descriptorWriteQueue.clear()
+                    pendingDescriptorValues.clear()
                     writingDescriptor = false
                     gatt?.close()
                     if (bluetoothGatt === gatt) {
@@ -245,23 +249,38 @@ class BluetoothLeService : Service() {
     }
 
     /**
-     * Sends a UTF-8 text message to the ESP32.
-     *
-     * Uses the Nordic UART Service RX characteristic when available, otherwise
-     * the first writable characteristic on the device.
+     * Sends a UTF-8 text message to the retranslator via the RX (write) characteristic.
      */
     @Suppress("DEPRECATION")
     fun sendMessage(text: String): Boolean {
         val gatt = bluetoothGatt ?: return false
         val characteristic = findWritableCharacteristic(gatt) ?: return false
-        characteristic.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
-        characteristic.value = text.toByteArray(Charsets.UTF_8)
-        return gatt.writeCharacteristic(characteristic)
+        val payload = text.toByteArray(Charsets.UTF_8)
+        val writeType =
+            if (characteristic.properties and BluetoothGattCharacteristic.PROPERTY_WRITE != 0) {
+                BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+            } else {
+                BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+            }
+
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            gatt.writeCharacteristic(characteristic, payload, writeType) == BluetoothGatt.GATT_SUCCESS
+        } else {
+            characteristic.writeType = writeType
+            characteristic.value = payload
+            gatt.writeCharacteristic(characteristic)
+        }
     }
 
     private fun findWritableCharacteristic(gatt: BluetoothGatt): BluetoothGattCharacteristic? {
         gatt.getService(MESSAGE_SERVICE_UUID)
             ?.getCharacteristic(MESSAGE_RX_CHARACTERISTIC_UUID)
+            ?.takeIf { characteristic ->
+                characteristic.properties and (
+                    BluetoothGattCharacteristic.PROPERTY_WRITE or
+                        BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE
+                    ) != 0
+            }
             ?.let { return it }
 
         return gatt.services
@@ -276,12 +295,31 @@ class BluetoothLeService : Service() {
     }
 
     /**
-     * Subscribes to every characteristic that supports notifications or
-     * indications. This makes the messenger work even if the ESP32 uses a
-     * custom service UUID.
+     * Subscribes to the TX (notify) characteristic for incoming messages.
+     * Falls back to any notifiable/indicatable characteristic if needed.
      */
     @Suppress("DEPRECATION")
     private fun enableNotifications(gatt: BluetoothGatt) {
+        val txCharacteristic = gatt.getService(MESSAGE_SERVICE_UUID)
+            ?.getCharacteristic(MESSAGE_TX_CHARACTERISTIC_UUID)
+        if (txCharacteristic != null) {
+            val properties = txCharacteristic.properties
+            val supportsNotify =
+                properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY != 0
+            val supportsIndicate =
+                properties and BluetoothGattCharacteristic.PROPERTY_INDICATE != 0
+            if (supportsNotify || supportsIndicate) {
+                if (setCharacteristicNotification(gatt, txCharacteristic, supportsNotify)) {
+                    return
+                }
+                Log.w(TAG, "Failed to enable notifications for TX characteristic, falling back")
+            } else {
+                Log.w(TAG, "TX characteristic ${txCharacteristic.uuid} does not support notify/indicate")
+            }
+        } else {
+            Log.w(TAG, "TX characteristic $MESSAGE_TX_CHARACTERISTIC_UUID not found, falling back")
+        }
+
         gatt.services.forEach { service ->
             service.characteristics.forEach { characteristic ->
                 val properties = characteristic.properties
@@ -301,21 +339,28 @@ class BluetoothLeService : Service() {
         gatt: BluetoothGatt,
         characteristic: BluetoothGattCharacteristic,
         useNotification: Boolean
-    ) {
+    ): Boolean {
         if (!gatt.setCharacteristicNotification(characteristic, true)) {
             Log.w(TAG, "setCharacteristicNotification failed for ${characteristic.uuid}")
-            return
+            return false
         }
 
         val descriptor =
-            characteristic.getDescriptor(CLIENT_CHARACTERISTIC_CONFIG_UUID) ?: return
-        descriptor.value = if (useNotification) {
+            characteristic.getDescriptor(CLIENT_CHARACTERISTIC_CONFIG_UUID) ?: run {
+                Log.w(TAG, "CCCD not found for ${characteristic.uuid}")
+                // Local notification enabled; some peripherals may still notify without CCCD write.
+                return true
+            }
+        val value = if (useNotification) {
             BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
         } else {
             BluetoothGattDescriptor.ENABLE_INDICATION_VALUE
         }
+        descriptor.value = value
         descriptorWriteQueue.addLast(descriptor)
+        pendingDescriptorValues[descriptor] = value
         writeNextDescriptor()
+        return true
     }
 
     @Suppress("DEPRECATION")
@@ -323,8 +368,18 @@ class BluetoothLeService : Service() {
         if (writingDescriptor) return
         val gatt = bluetoothGatt ?: return
         val descriptor = descriptorWriteQueue.pollFirst() ?: return
+        val value = pendingDescriptorValues.remove(descriptor)
+            ?: descriptor.value
+            ?: BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
         writingDescriptor = true
-        if (!gatt.writeDescriptor(descriptor)) {
+
+        val started = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            gatt.writeDescriptor(descriptor, value) == BluetoothGatt.GATT_SUCCESS
+        } else {
+            descriptor.value = value
+            gatt.writeDescriptor(descriptor)
+        }
+        if (!started) {
             Log.w(TAG, "writeDescriptor failed for ${descriptor.characteristic.uuid}")
             writingDescriptor = false
             writeNextDescriptor()
@@ -340,7 +395,7 @@ class BluetoothLeService : Service() {
 
     // [START android_bluetooth_broadcast]
     private fun broadcastUpdate(action: String) {
-        val intent = Intent(action)
+        val intent = Intent(action).setPackage(packageName)
         sendBroadcast(intent)
     }
     // [END android_bluetooth_broadcast]
@@ -370,6 +425,7 @@ class BluetoothLeService : Service() {
 
         val message = MessengerMessageParser.parse(raw, fallbackSender)
         val intent = Intent(action).apply {
+            setPackage(packageName)
             putExtra(EXTRA_SENDER, message.sender)
             putExtra(EXTRA_MESSAGE, message.text)
             putExtra(EXTRA_TIMESTAMP, message.timestamp)
@@ -388,6 +444,7 @@ class BluetoothLeService : Service() {
     private fun close() {
         connecting = false
         descriptorWriteQueue.clear()
+        pendingDescriptorValues.clear()
         writingDescriptor = false
         bluetoothGatt?.close()
         bluetoothGatt = null

@@ -12,4 +12,9 @@
     <string name="bluetooth_not_supported">Bluetooth is not supported on this device</string>
     <string name="bluetooth_permission_required">Bluetooth permissions are required to scan for devices</string>
     <string name="bluetooth_scan_failed">Bluetooth scan failed</string>
+    <string name="scan_connect">Scan</string>
+    <string name="no_device_selected">No device selected</string>
+    <string name="select_device">Select a device</string>
+    <string name="scanning">Scanning…</string>
+    <string name="no_devices_found">No devices found</string>
 </resources>
